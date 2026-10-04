@@ -1,0 +1,15 @@
+# Data and generated files (too large for GitHub)
+data/
+neo4j_data/
+models/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Editor and OS
+.vscode/
+.DS_Store
