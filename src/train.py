@@ -38,6 +38,9 @@ from config import PROCESSED, MODELS, FIGURES, ROOT
 
 GRAPH = ["pagerank", "wcc_size", "n_neighbours", "log_scc_size", "in_cycle_scc"]
 RULES = ["fan_out", "fan_in", "gather_scatter", "scatter_gather", "cycle", "rule_any"]
+# Excluded from every model. wcc_size: 99% of launderers sit in the giant component
+# (likely a generator artifact); retraining without it showed no loss on val.
+EXCLUDE = ["wcc_size"]
 KS = [100, 500, 1000, 5000]
 
 
@@ -48,11 +51,12 @@ def load(split):
 def groups(cols):
     nbr = [c for c in cols if c.startswith("nbr_")]
     tab = [c for c in cols if c not in GRAPH + RULES + nbr]
-    return {
+    feature_sets = {
         "xgb_tabular": tab,
         "xgb_graph": tab + GRAPH + nbr,
         "xgb_all": tab + GRAPH + nbr + RULES,
     }
+    return {k: [c for c in v if c not in EXCLUDE] for k, v in feature_sets.items()}
 
 
 def fit(Xtr, ytr, Xva, yva):
