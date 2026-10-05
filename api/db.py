@@ -9,6 +9,16 @@ MERGE (a)-[t:TX {tx_id: $tx_id}]->(b)
 ON CREATE SET t.ts = $ts, t.amt_paid = $amt_paid, t.fmt = $fmt, t.label = $label
 """
 
+# Micro-batch write. CREATE (not MERGE) for edges: MERGE on a hub account would scan all
+# its edges per insert. The simulator's --reset removes test-period edges first, so a
+# replay never duplicates them.
+Q_WRITE_BATCH = """
+UNWIND $rows AS r
+MERGE (a:Account {id: r.src})
+MERGE (b:Account {id: r.dst})
+CREATE (a)-[:TX {tx_id: r.tx_id, ts: r.ts, amt_paid: r.amt_paid, fmt: r.fmt, label: r.label}]->(b)
+"""
+
 Q_HOP1 = """
 MATCH (a:Account {id: $id})-[t:TX]-(b:Account)
 WHERE t.ts >= $since AND a <> b
@@ -49,6 +59,13 @@ class Graph:
             s.run(Q_WRITE, src=tx["src"], dst=tx["dst"], tx_id=tx["tx_id"],
                   ts=int(tx["ts"].timestamp()), amt_paid=tx["amt_paid"],
                   fmt=tx["fmt"], label=tx.get("label")).consume()
+
+    def write_batch(self, txs: list[dict]):
+        rows = [{"src": t["src"], "dst": t["dst"], "tx_id": t["tx_id"],
+                 "ts": int(t["ts"].timestamp()), "amt_paid": t["amt_paid"],
+                 "fmt": t["fmt"], "label": t.get("label")} for t in txs]
+        with self.driver.session() as s:
+            s.run(Q_WRITE_BATCH, rows=rows).consume()
 
     def subgraph(self, account: str, since: int, hop1: int = 40, per: int = 5):
         """Two-hop neighbourhood, capped so hub accounts can't blow up the result."""

@@ -10,6 +10,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -18,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Query      # noqa: E402
 
 from config import VAL_START                           # noqa: E402
 from api.db import Graph                               # noqa: E402
-from api.schemas import AccountScore, Subgraph, Transaction, TxResult  # noqa: E402
+from api.schemas import AccountScore, Subgraph, Transaction, TxBatch, TxResult  # noqa: E402
 from api.scoring import Scorer                         # noqa: E402
 
 state = {}
@@ -59,6 +60,44 @@ def transaction(tx: Transaction):
     ms = (time.perf_counter() - t0) * 1000
     state["scorer"].latencies.append(ms)
     return {"tx_id": tx.tx_id, "scores": scores, "latency_ms": round(ms, 2)}
+
+
+@app.post("/transactions/batch")
+def transactions_batch(b: TxBatch):
+    """Micro-batch ingest: one graph write for the whole batch, then every touched
+    account is rescored in a single vectorised pass."""
+    t0 = time.perf_counter()
+    txs = [t.model_dump() for t in b.transactions]
+    state["graph"].write_batch(txs)
+    t1 = time.perf_counter()
+    scored = state["scorer"].ingest_many(txs, score=b.score)
+    t2 = time.perf_counter()
+    info = {"transactions": len(txs), "accounts_scored": scored,
+            "write_ms": round((t1 - t0) * 1000), "score_ms": round((t2 - t1) * 1000),
+            "total_ms": round((t2 - t0) * 1000),
+            "tx_per_s": round(len(txs) / max(t2 - t0, 1e-9), 1)}
+    state["scorer"].batches.append(info)
+    return info
+
+
+@app.post("/admin/rescore-all")
+def rescore_all(at: Optional[str] = None):
+    """Rescore every account in the rolling window, optionally moving the stream clock
+    first (the simulator uses the end of the test window for its final evaluation)."""
+    return state["scorer"].rescore_all(at)
+
+
+@app.post("/admin/refresh-graph")
+def refresh_graph():
+    """Recompute graph and neighbourhood features from the current 48h window
+    (what a scheduled batch job would do)."""
+    return state["scorer"].refresh_graph()
+
+
+@app.get("/scores")
+def all_scores():
+    """Latest score for every scored account (used for offline-vs-live evaluation)."""
+    return state["scorer"].all_scores()
 
 
 @app.get("/score/{account}", response_model=AccountScore)

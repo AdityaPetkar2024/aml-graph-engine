@@ -18,6 +18,11 @@ class Transaction(BaseModel):
         default=None, description="Ground truth, demo only. NEVER used for scoring.")
 
 
+class TxBatch(BaseModel):
+    transactions: list[Transaction]
+    score: bool = True           # False = ingest only; score later via /admin/rescore-all
+
+
 class Reason(BaseModel):
     feature: str
     description: str

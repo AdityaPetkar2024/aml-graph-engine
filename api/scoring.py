@@ -12,8 +12,10 @@ Scoring engine: speed layer + batch layer.
 
 In production the in-memory window would live in a feature store such as Redis.
 """
+import heapq
 import json
 import threading
+import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
@@ -22,7 +24,7 @@ import pandas as pd
 import xgboost as xgb
 
 from config import MODELS, PROCESSED
-from features import tabular_features, usd_rates
+from features import graph_features, neighbour_features, tabular_features, usd_rates
 
 WINDOW_DAYS = 2                      # same length as the val/test windows
 WINDOW = pd.Timedelta(days=WINDOW_DAYS)
@@ -98,7 +100,12 @@ class Scorer:
         self.live_cols = [c for c in self.feats if c not in self.batch_cols]
 
         batch = pd.read_parquet(PROCESSED / BATCH_FILE).set_index("account")
-        self.batch = batch[self.batch_cols]
+        self.initial_batch = batch[self.batch_cols]
+        # PageRank is computed over the full account universe offline, so the live
+        # refresh uses the same node count to give identical values.
+        ids = pd.read_parquet(PROCESSED / "transactions.parquet", columns=["src", "dst"])
+        self.n_accounts = int(pd.unique(pd.concat([ids["src"], ids["dst"]])).size)
+        del ids
         self.rates = load_rates()
         self.lock = threading.Lock()
         self.reset()
@@ -109,8 +116,12 @@ class Scorer:
             self.latest = {}                       # account -> AccountScore dict
             self.demo_label = {}
             self.latencies = deque(maxlen=2000)
+            self.batches = deque(maxlen=200)       # micro-batch timings
             self.n_tx = 0
             self.now = None                        # stream clock = latest tx timestamp
+            self.batch = self.initial_batch
+            self.batch_info = f"{BATCH_FILE} (Sep 7-8 window)"
+            self.refreshes = []
             self._warm_start()
 
     def _warm_start(self):
@@ -144,8 +155,8 @@ class Scorer:
         rows = self.window.get(account, [])
         if rows and self.now is not None:                 # drop tx older than 48h
             cutoff = self.now - WINDOW
-            if rows[0][2] <= cutoff:
-                rows = [r for r in rows if r[2] > cutoff]
+            if rows[0][2] < cutoff:
+                rows = [r for r in rows if r[2] >= cutoff]
                 self.window[account] = rows
         live = pd.Series(np.nan, index=self.live_cols, dtype=float)
         if rows:
@@ -157,6 +168,12 @@ class Scorer:
                         live[c] = r[c]
                     elif c.startswith("fmt_"):
                         live[c] = 0.0              # format never used by this account
+            # Calendar days in a rolling 48h window can be 3 (e.g. Sep 7, 8, 9), giving
+            # values up to 1.5 that training never saw. Count 24h blocks back from the
+            # stream clock instead, so the value stays in [0, 1] as in training.
+            if "active_day_frac" in live.index and self.now is not None:
+                blocks = {int((self.now - r[2]).total_seconds() // 86400) for r in rows}
+                live["active_day_frac"] = min(len(blocks), WINDOW_DAYS) / WINDOW_DAYS
         if account in self.batch.index:
             graph, source = self.batch.loc[account], "batch"
         else:
@@ -198,9 +215,144 @@ class Scorer:
                 out.append(s)
             return out
 
+    # ------------------------------------------------------------ micro-batch
+    def _rows_for(self, accounts):
+        """Window rows touching any of `accounts`, pruned to the rolling window and
+        de-duplicated (each tx tuple sits in both its payer's and payee's list)."""
+        cutoff = self.now - WINDOW
+        seen, counts = {}, {}
+        for a in accounts:
+            rows = self.window.get(a)
+            if not rows:
+                counts[a] = 0
+                continue
+            if rows[0][2] < cutoff:
+                rows = [r for r in rows if r[2] >= cutoff]
+                self.window[a] = rows
+            counts[a] = len(rows)
+            for r in rows:
+                seen[id(r)] = r
+        return list(seen.values()), counts
+
+    def features_many(self, accounts):
+        """Vectorised version of feature_vector() for many accounts at once."""
+        rows, counts = self._rows_for(accounts)
+        idx = pd.Index([a for a in accounts if counts.get(a, 0) > 0])
+        live = pd.DataFrame(np.nan, index=idx, columns=self.live_cols, dtype=float)
+        if len(idx):
+            d = pd.DataFrame(rows, columns=COLS)
+            F = tabular_features(d, WINDOW_DAYS).reindex(idx)
+            for c in self.live_cols:
+                if c in F.columns:
+                    live[c] = F[c].astype(float).to_numpy()
+                elif c.startswith("fmt_"):
+                    live[c] = 0.0
+            fmt = [c for c in self.live_cols if c.startswith("fmt_")]
+            live[fmt] = live[fmt].fillna(0.0)
+            if "active_day_frac" in live.columns:      # same 24h-block rule as feature_vector
+                both = pd.concat([d[["s", "ts"]].rename(columns={"s": "acct"}),
+                                  d[["t", "ts"]].rename(columns={"t": "acct"})])
+                both = both[both["acct"].isin(idx)]
+                blk = ((self.now - both["ts"]).dt.total_seconds() // 86400).astype(int)
+                adf = blk.groupby(both["acct"]).nunique().clip(upper=WINDOW_DAYS) / WINDOW_DAYS
+                live["active_day_frac"] = adf.reindex(idx).to_numpy()
+        graph = self.batch.reindex(idx)
+        X = pd.concat([live, graph], axis=1)[self.feats].astype(float)
+        n = np.array([counts[a] for a in idx])
+        return X, n
+
+    def _score_many(self, accounts, reasons_for=1000):
+        X, n = self.features_many(accounts)
+        if X.empty:
+            return 0
+        rng = (0, self.n_trees)
+        p = self.booster.predict(xgb.DMatrix(X.to_numpy(), feature_names=self.feats),
+                                 iteration_range=rng)
+        in_batch = X.index.isin(self.batch.index)
+        now = datetime.now(timezone.utc)
+        for i, acct in enumerate(X.index):
+            self.latest[acct] = {"account": acct, "score": float(p[i]), "reasons": None,
+                                 "tx_in_window": int(n[i]),
+                                 "graph_features": "batch" if in_batch[i] else "missing",
+                                 "demo_label": self.demo_label.get(acct), "scored_at": now}
+        top = np.argsort(-p)[:reasons_for]           # SHAP only where analysts will look
+        sub = X.iloc[top]
+        contrib = self.booster.predict(xgb.DMatrix(sub.to_numpy(), feature_names=self.feats),
+                                       pred_contribs=True, iteration_range=rng)[:, :-1]
+        for j, i in enumerate(top):
+            c, x = contrib[j], sub.iloc[j]
+            self.latest[X.index[i]]["reasons"] = [{
+                "feature": self.feats[k], "description": describe(self.feats[k]),
+                "value": None if pd.isna(x.iloc[k]) else float(x.iloc[k]),
+                "contribution": float(c[k]),
+            } for k in np.argsort(-c)[:3] if c[k] > 0]
+        return len(X)
+
+    def refresh_graph(self) -> dict:
+        """Batch layer refresh: recompute graph + neighbourhood features from the current
+        rolling window with the same functions features.py uses offline."""
+        with self.lock:
+            t0 = time.perf_counter()
+            rows, _ = self._rows_for(list(self.window))
+            d = pd.DataFrame(rows, columns=COLS)
+            codes, accts = pd.factorize(pd.concat([d["s"], d["t"]], ignore_index=True))
+            n = len(d)
+            d["s"], d["t"] = codes[:n].astype("int32"), codes[n:].astype("int32")
+            F = tabular_features(d, WINDOW_DAYS)
+            G, U = graph_features(d, max(self.n_accounts, len(accts)))
+            F = F.join(G, how="left")
+            F["rule_any"] = 0.0                    # not used by the model (see train.py)
+            F = F.join(neighbour_features(F, U), how="left")
+            B = F[self.batch_cols].copy()
+            B.index = pd.Index(np.asarray(accts)[B.index.to_numpy()], name="account")
+            self.batch = B
+            self.batch_info = f"refreshed at {self.now} ({len(B):,} accounts)"
+            info = {"accounts": len(B), "window_tx": n, "stream_clock": str(self.now),
+                    "seconds": round(time.perf_counter() - t0, 1)}
+            self.refreshes.append(info)
+            return info
+
+    def ingest_many(self, txs: list[dict], score: bool = True) -> int:
+        with self.lock:
+            touched = {}
+            for tx in txs:
+                row = self._row(tx)
+                self.now = row[2] if self.now is None else max(self.now, row[2])
+                self.window[tx["src"]].append(row)
+                if tx["dst"] != tx["src"]:
+                    self.window[tx["dst"]].append(row)
+                if tx.get("label") == 1:
+                    self.demo_label[tx["src"]] = self.demo_label[tx["dst"]] = 1
+                touched[tx["src"]] = touched[tx["dst"]] = None
+            self.n_tx += len(txs)
+            return self._score_many(list(touched)) if score else 0
+
+    def rescore_all(self, at=None) -> dict:
+        """Set the stream clock (e.g. to the end of the test window) and rescore every
+        account active in the rolling window: a clean end-of-window snapshot."""
+        with self.lock:
+            t0 = time.perf_counter()
+            if at is not None:
+                at = pd.Timestamp(at)
+                self.now = at.tz_convert(None) if at.tzinfo else at
+            self.latest = {}
+            n = self._score_many(list(self.window), reasons_for=1000)
+            return {"accounts": n, "seconds": round(time.perf_counter() - t0, 1),
+                    "stream_clock": str(self.now)}
+
+    def all_scores(self) -> dict:
+        with self.lock:
+            return {"stream_clock": str(self.now),
+                    "accounts": list(self.latest),
+                    "scores": [v["score"] for v in self.latest.values()]}
+
     def alerts(self, n: int) -> list[dict]:
         with self.lock:
-            return sorted(self.latest.values(), key=lambda s: -s["score"])[:n]
+            top = heapq.nlargest(n, self.latest.values(), key=lambda s: s["score"])
+            for i, s in enumerate(top):
+                if s["reasons"] is None:               # filled lazily for batch-scored accounts
+                    top[i] = self.latest[s["account"]] = self.score(s["account"])
+            return top
 
     def stats(self) -> dict:
         lat = np.array(self.latencies)
@@ -208,6 +360,9 @@ class Scorer:
         return {"transactions": self.n_tx, "accounts_scored": len(self.latest),
                 "latency_ms_p50": pct(50), "latency_ms_p95": pct(95),
                 "model_trees": self.n_trees, "features": len(self.feats),
-                "batch_features_from": BATCH_FILE,
+                "batch_features_from": self.batch_info,
+                "graph_refreshes": len(self.refreshes),
                 "warm_start_tx": getattr(self, "warm_tx", 0),
+                "batches": len(self.batches),
+                "last_batch": self.batches[-1] if self.batches else None,
                 "stream_clock": str(self.now)}

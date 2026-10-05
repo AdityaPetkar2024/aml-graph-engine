@@ -38,10 +38,17 @@ from config import PROCESSED, MODELS, FIGURES, ROOT
 
 GRAPH = ["pagerank", "wcc_size", "n_neighbours", "log_scc_size", "in_cycle_scc"]
 RULES = ["fan_out", "fan_in", "gather_scatter", "scatter_gather", "cycle", "rule_any"]
-# Excluded from every model. wcc_size: 99% of launderers sit in the giant component
-# (likely a generator artifact); retraining without it showed no loss on val.
-EXCLUDE = ["wcc_size"]
+# Excluded from every model.
+#   wcc_size: 99% of launderers sit in the giant component (likely a generator artifact);
+#             retraining without it showed no loss on val.
+#   nbr_mean_rule_any: needs the Cypher rule engine at serving time; dropped so the live
+#             graph refresh depends only on the transaction window.
+EXCLUDE = ["wcc_size", "nbr_mean_rule_any"]
 KS = [100, 500, 1000, 5000]
+# Only models whose features the live API can compute may become the production model.
+# xgb_all needs rule scores (the Cypher rule engine) at serving time, so it stays a
+# comparison only.
+SERVABLE = ("xgb_tabular", "xgb_graph")
 
 
 def load(split):
@@ -137,9 +144,10 @@ def main():
               f"val PR-AUC {val_ap[name]:.3f}, test PR-AUC {results[-1]['pr_auc']:.3f}  "
               f"[{time.time() - t:.0f}s]")
 
-    # Choose the production model on VALIDATION only (picking on test would leak)
-    chosen = max(val_ap, key=val_ap.get)
-    print(f"\nProduction model chosen on val PR-AUC: {chosen}")
+    # Choose the production model on VALIDATION only (picking on test would leak),
+    # among the models the live API can serve
+    chosen = max((m for m in val_ap if m in SERVABLE), key=val_ap.get)
+    print(f"\nProduction model chosen on val PR-AUC (servable models only): {chosen}")
 
     res = pd.DataFrame(results)
     show = ["model", "pr_auc", "roc_auc", "recall@100", "recall@1000",
