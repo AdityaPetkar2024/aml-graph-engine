@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -6,9 +7,10 @@ PROCESSED = ROOT / "data" / "processed"
 MODELS = ROOT / "models"
 FIGURES = ROOT / "reports" / "figures"
 
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "password123"
+# Defaults work on the host; docker-compose overrides NEO4J_URI to reach the neo4j service.
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "password123")
 
 # Date-based split. Normal activity stops after Sep 10 (generation artifact),
 # so everything from DATA_END onward is dropped.

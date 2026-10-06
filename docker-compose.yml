@@ -1,17 +1,73 @@
+# Whole system:   docker compose up -d --build
+#   Neo4j      http://localhost:7474   (graph browser)
+#   API        http://localhost:8000/docs
+#   Dashboard  http://localhost:8501
+# Needs the offline pipeline outputs first: data/processed/, models/, reports/ (make pipeline).
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: docker/app.Dockerfile
+  image: aml-graph-engine:latest
+  user: "1000:1000"                  # match `id -u`:`id -g` so mounted files stay yours
+  restart: unless-stopped
+
 services:
   neo4j:
     image: neo4j:5.26
     container_name: aml-neo4j
-    user: "1000:1000"            # match `id -u`:`id -g` on your machine
+    user: "1000:1000"
+    restart: unless-stopped
     ports:
-      - "7474:7474"              # browser UI
-      - "7687:7687"              # bolt (Python driver)
+      - "7474:7474"
+      - "7687:7687"
     environment:
       NEO4J_AUTH: neo4j/password123
       NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
-      NEO4J_server_memory_heap_max__size: 2G     # use 1G on an 8 GB laptop
-      NEO4J_server_memory_pagecache_size: 2G     # use 1G on an 8 GB laptop
+      NEO4J_server_memory_heap_max__size: 2G
+      NEO4J_server_memory_pagecache_size: 2G
       NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
     volumes:
       - ./neo4j_data:/data
       - ./data/processed:/import
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p password123 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  api:
+    <<: *app
+    container_name: aml-api
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --log-level warning
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/processed:/app/data/processed:ro
+      - ./models:/app/models
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s                # warm start loads the previous 48h of transactions
+
+  dashboard:
+    <<: *app
+    container_name: aml-dashboard
+    command: streamlit run dashboard/app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+    environment:
+      AML_API: http://api:8000
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./reports:/app/reports:ro
+    depends_on:
+      api:
+        condition: service_healthy

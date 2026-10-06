@@ -1,0 +1,10 @@
+data/
+neo4j_data/
+models/
+reports/
+notebooks/
+venv/
+.venv/
+.git/
+**/__pycache__/
+**/.ipynb_checkpoints/
